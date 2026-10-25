@@ -9,6 +9,7 @@ use crate::engine_supervisor::{
     Unloading,
 };
 use crate::managers::audio::AudioRecordingManager;
+use crate::managers::bark::{BarkEngine, BARK_MODEL_ID};
 use crate::managers::model::ModelManager;
 use crate::settings::{
     get_settings, AppSettings, ChineseScript, ModelUnloadTimeout, TranscribeAcceleratorSetting,
@@ -240,6 +241,9 @@ pub struct TranscriptionManager {
     /// The transcribe-cpp engine: owns the worker process, its model, and
     /// recovery from crashes and hangs.
     engine: EngineSupervisor,
+    /// Underdog Bark Python worker; when set it is the active model and
+    /// `engine` is unloaded.
+    bark: Arc<Mutex<Option<BarkEngine>>>,
     model_manager: Arc<ModelManager>,
     app_handle: AppHandle,
     current_model_id: Arc<Mutex<Option<String>>>,
@@ -275,6 +279,7 @@ impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
         let manager = Self {
             engine: EngineSupervisor::new(!transcribe_gpu_disabled_for_host()),
+            bark: Arc::new(Mutex::new(None)),
             model_manager,
             app_handle: app_handle.clone(),
             current_model_id: Arc::new(Mutex::new(None)),
@@ -368,7 +373,7 @@ impl TranscriptionManager {
     pub fn is_model_loaded(&self) -> bool {
         // A transcribe-cpp model stays loaded while it is busy, so a batch
         // run or stream in progress never reads as "unloaded".
-        self.engine.loaded().is_some()
+        self.engine.loaded().is_some() || self.bark.lock().unwrap().is_some()
     }
 
     /// Accelerator changes should not disturb the current transcription. Mark
@@ -457,6 +462,7 @@ impl TranscriptionManager {
     /// it. Only the worker's exit is left to wait for.
     fn begin_unload(&self) -> Unloading {
         let unloading = self.engine.unload();
+        self.bark.lock().unwrap().take();
         {
             let mut current_model = self.current_model_id.lock().unwrap();
             *current_model = None;
@@ -581,6 +587,29 @@ impl TranscriptionManager {
             let mut current_model = self.current_model_id.lock().unwrap();
             *current_model = None;
         }
+
+        if model_id == BARK_MODEL_ID {
+            // Free the transcribe-cpp model first; Bark has its own worker.
+            drop(self.engine.unload());
+            let engine = BarkEngine::load(&model_path).inspect_err(|e| {
+                emit_loading_failed(&format!("Failed to load model {}: {}", model_id, e))
+            })?;
+            *self.bark.lock().unwrap() = Some(engine);
+            *self.current_model_id.lock().unwrap() = Some(model_id.to_string());
+            self.touch_activity();
+            let _ = self.app_handle.emit(
+                "model-state-changed",
+                ModelStateEvent {
+                    event_type: "loading_completed".to_string(),
+                    model_id: Some(model_id.to_string()),
+                    model_name: Some(model_info.name.clone()),
+                    error: None,
+                },
+            );
+            return Ok(());
+        }
+        // A transcribe-cpp model replaces a loaded Bark worker.
+        self.bark.lock().unwrap().take();
 
         // The backend is chosen at load time. With an explicit
         // `device_index` (the --device-index flag) hard-select that
@@ -950,12 +979,33 @@ impl TranscriptionManager {
             return Ok(String::new());
         }
 
-        let outcome = match live {
-            Some(outcome) => outcome,
-            None => self.decode_batch(audio)?,
-        };
         let settings = get_settings(&self.app_handle);
-        let final_result = finish_text(outcome, &settings);
+        let bark_text = {
+            let mut bark = self.bark.lock().unwrap();
+            match bark.as_mut() {
+                Some(engine) => {
+                    self.touch_activity();
+                    Some(engine.transcribe(&audio)?)
+                }
+                None => None,
+            }
+        };
+        let final_result = match bark_text {
+            Some(text) => post_process_transcription_text(
+                text,
+                &settings,
+                false,
+                &OutputLanguageEvidence::UserSelected("en".to_string()),
+                &["en".to_string()],
+            ),
+            None => {
+                let outcome = match live {
+                    Some(outcome) => outcome,
+                    None => self.decode_batch(audio)?,
+                };
+                finish_text(outcome, &settings)
+            }
+        };
 
         let translation_note = if settings.translate_to_english {
             " (translated)"

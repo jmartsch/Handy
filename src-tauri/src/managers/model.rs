@@ -837,6 +837,34 @@ impl ModelManager {
 
         let mut available_models = HashMap::new();
 
+        // Underdog Bark: English-only, runs in a Python worker (torch), not
+        // through transcribe-cpp. Install manually into <models>/bark-3.0-clean/.
+        available_models.insert(
+            super::bark::BARK_MODEL_ID.to_string(),
+            ModelInfo {
+                id: super::bark::BARK_MODEL_ID.to_string(),
+                name: "Underdog Bark 3.0 Clean".to_string(),
+                description:
+                    "English only, removes fillers. Needs Python + torch (manual install)."
+                        .to_string(),
+                filename: "bark-3.0-clean/model.bark".to_string(),
+                source: ModelSource::Local,
+                size_mb: 180,
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                accuracy_score: 0.90,
+                speed_score: 0.50,
+                supports_translation: false,
+                is_recommended: false,
+                supported_languages: vec!["en".to_string()],
+                supports_language_selection: false,
+                is_custom: false,
+                supports_streaming: false,
+                supports_language_detection: false,
+            },
+        );
+
         // Whisper supported languages (99 languages from tokenizer)
         let whisper_languages: Vec<String> = vec![
             "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
